@@ -5,19 +5,19 @@ import requests
 
 class ArtifactoryClient:
     """
-    Client simple Artifactory - FILE ONLY
+    Client Artifactory - FILE ONLY
 
-    Variables d'environnement :
-        ARTIFACTORY_URL=https://.../artifactory
-        ARTIFACTORY_API_KEY=xxxxxxxx
-        ARTIFACTORY_REPO=my-repository
+    Variables d'environnement requises :
+        ARTIFACTORY_URL=https://artifactory.mycloud.intrabpce.fr:443/artifactory
+        ARTIFACTORY_API_KEY=xxxxxxxxxxxxxxxx
+        ARTIFACTORY_REPO=e64-generic-fircocontinuity
     """
 
-    def __init__(self):
-        self.base_url = os.getenv("ARTIFACTORY_URL", "").strip()
+    def __init__(self, timeout: int = 60):
+        self.base_url = os.getenv("ARTIFACTORY_URL", "").strip().rstrip("/")
         self.api_key = os.getenv("ARTIFACTORY_API_KEY", "").strip()
-        self.repository = os.getenv("ARTIFACTORY_REPO", "").strip()
-        self.timeout = 60
+        self.repository = os.getenv("ARTIFACTORY_REPO", "").strip().strip("/")
+        self.timeout = timeout
 
         if not self.base_url:
             raise ValueError("ARTIFACTORY_URL is required")
@@ -29,35 +29,23 @@ class ArtifactoryClient:
     # =========================================================
     # INTERNAL
     # =========================================================
-    def _build_artifact_url(self, key: str) -> str:
-        if key is None:
-            raise ValueError("key must not be None")
-
-        clean_key = key.strip().lstrip("/")
-        if not clean_key:
-            raise ValueError("key must not be empty")
-
-        return (
-            f"{self.base_url.rstrip('/')}/"
-            f"{self.repository.strip('/')}/"
-            f"{clean_key}"
-        )
-
-    def _build_storage_url(self, path: str = "") -> str:
-        """
-        URL API storage Artifactory pour lister un dossier.
-        """
-        clean_repo = self.repository.strip("/")
-        clean_path = (path or "").strip().strip("/")
-
-        if clean_path:
-            return f"{self.base_url.rstrip('/')}/api/storage/{clean_repo}/{clean_path}"
-        return f"{self.base_url.rstrip('/')}/api/storage/{clean_repo}"
-
     def _headers(self) -> dict:
         return {
             "X-JFrog-Art-Api": self.api_key
         }
+
+    def _build_artifact_url(self, key: str) -> str:
+        clean_key = (key or "").strip().lstrip("/")
+        if not clean_key:
+            raise ValueError("key must not be empty")
+
+        return f"{self.base_url}/{self.repository}/{clean_key}"
+
+    def _build_storage_url(self, path: str = "") -> str:
+        clean_path = (path or "").strip().strip("/")
+        if clean_path:
+            return f"{self.base_url}/api/storage/{self.repository}/{clean_path}"
+        return f"{self.base_url}/api/storage/{self.repository}"
 
     # =========================================================
     # SHA256
@@ -93,7 +81,7 @@ class ArtifactoryClient:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        url = self._build_artifact_url(key)
+        artifact_url = self._build_artifact_url(key)
         local_sha256 = self.compute_sha256_file(file_path)
 
         headers = self._headers()
@@ -104,7 +92,7 @@ class ArtifactoryClient:
 
         with open(file_path, "rb") as f:
             response = requests.put(
-                url,
+                artifact_url,
                 headers=headers,
                 data=f,
                 timeout=self.timeout
@@ -115,12 +103,32 @@ class ArtifactoryClient:
                 f"Upload failed: status={response.status_code}, body={response.text}"
             )
 
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+
+        returned_sha256 = None
+        if isinstance(payload, dict):
+            returned_sha256 = (
+                (payload.get("checksums") or {}).get("sha256")
+                or (payload.get("originalChecksums") or {}).get("sha256")
+            )
+
         if verify_checksum:
-            if not self.verify_sha256_against_object(key=key, expected_sha256=local_sha256):
-                raise RuntimeError("SHA256 mismatch after upload")
+            if returned_sha256:
+                if returned_sha256.lower() != local_sha256.lower():
+                    raise RuntimeError(
+                        "SHA256 mismatch between local file and Artifactory response"
+                    )
+            else:
+                remote_sha256 = self.get_remote_sha256(key)
+                if remote_sha256 != local_sha256.lower():
+                    raise RuntimeError("SHA256 mismatch after upload")
 
         return {
-            "url": url,
+            "url": payload.get("downloadUri") if isinstance(payload, dict) else artifact_url,
+            "storage_url": payload.get("uri") if isinstance(payload, dict) else None,
             "key": key,
             "sha256": local_sha256,
             "local_file": file_path,
@@ -128,34 +136,40 @@ class ArtifactoryClient:
         }
 
     # =========================================================
-    # VERIFY SHA256
+    # REMOTE SHA256
     # =========================================================
-    def verify_sha256_against_object(self, key: str, expected_sha256: str) -> bool:
-        if not expected_sha256 or not expected_sha256.strip():
-            raise ValueError("expected_sha256 must not be empty")
+    def get_remote_sha256(self, key: str) -> str:
+        storage_url = self._build_storage_url(key)
 
-        url = self._build_artifact_url(key)
-
-        response = requests.head(
-            url,
+        response = requests.get(
+            storage_url,
             headers=self._headers(),
             timeout=self.timeout
         )
 
         if response.status_code != 200:
             raise RuntimeError(
-                f"Verification failed: status={response.status_code}, body={response.text}"
+                f"Get metadata failed: status={response.status_code}, body={response.text}"
             )
 
+        payload = response.json()
+
         remote_sha256 = (
-            response.headers.get("X-Checksum-Sha256")
-            or response.headers.get("x-checksum-sha256")
+            (payload.get("checksums") or {}).get("sha256")
+            or (payload.get("originalChecksums") or {}).get("sha256")
         )
 
         if not remote_sha256:
-            raise RuntimeError("SHA256 header not found in Artifactory response")
+            raise RuntimeError("Remote sha256 not found in Artifactory metadata")
 
-        return remote_sha256.lower() == expected_sha256.lower()
+        return remote_sha256.lower()
+
+    def verify_sha256_against_object(self, key: str, expected_sha256: str) -> bool:
+        if not expected_sha256 or not expected_sha256.strip():
+            raise ValueError("expected_sha256 must not be empty")
+
+        remote_sha256 = self.get_remote_sha256(key)
+        return remote_sha256 == expected_sha256.lower()
 
     # =========================================================
     # DOWNLOAD FILE
@@ -164,14 +178,14 @@ class ArtifactoryClient:
         if not output_path or not output_path.strip():
             raise ValueError("output_path must not be empty")
 
-        url = self._build_artifact_url(key)
+        artifact_url = self._build_artifact_url(key)
 
         parent_dir = os.path.dirname(output_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
 
         response = requests.get(
-            url,
+            artifact_url,
             headers=self._headers(),
             stream=True,
             timeout=self.timeout
@@ -188,7 +202,7 @@ class ArtifactoryClient:
                     f.write(chunk)
 
         return {
-            "url": url,
+            "url": artifact_url,
             "key": key,
             "output_path": output_path
         }
@@ -196,37 +210,23 @@ class ArtifactoryClient:
     # =========================================================
     # LIST DIRECTORY
     # =========================================================
-    def list_directory(
-        self,
-        path: str = "",
-        deep: int = 0,
-        list_folders: int = 1
-    ) -> dict:
-        """
-        Liste le contenu d'un répertoire Artifactory.
-
-        Exemples:
-            list_directory()
-            list_directory("DEMO")
-            list_directory("DEMO/subfolder", deep=1)
-        """
+    def list_directory(self, path: str = "", deep: int = 0, list_folders: int = 1) -> dict:
         if deep not in (0, 1):
             raise ValueError("deep must be 0 or 1")
 
         if list_folders not in (0, 1):
             raise ValueError("list_folders must be 0 or 1")
 
-        url = self._build_storage_url(path)
-        params = {
-            "list": "",
-            "deep": deep,
-            "listFolders": list_folders
-        }
+        storage_url = self._build_storage_url(path)
 
         response = requests.get(
-            url,
+            storage_url,
             headers=self._headers(),
-            params=params,
+            params={
+                "list": "1",
+                "deep": deep,
+                "listFolders": list_folders
+            },
             timeout=self.timeout
         )
 
@@ -243,3 +243,41 @@ class ArtifactoryClient:
             "created": payload.get("created"),
             "files": payload.get("files", [])
         }
+        ####################################################################################################################################################################################################################################
+        import os
+from services.artifactory_client import ArtifactoryClient
+
+artifactory_client = ArtifactoryClient()
+
+try:
+    if row_count == 0:
+        raise ValueError("CSV file is empty")
+
+    artifact_key = f"DEMO/{os.path.basename(output_path)}"
+
+    result = artifactory_client.upload_file(
+        file_path=output_path,
+        key=artifact_key,
+        content_type="text/csv",
+        verify_checksum=True
+    )
+
+    self.logger.info("CSV uploaded successfully to Artifactory and SHA256 verified")
+
+    return {
+        "artifact_url": result["url"],
+        "row_count": row_count,
+        "sha256": result["sha256"]
+    }
+
+except Exception as e:
+    self.logger.error(f"Failed to write/upload CSV to Artifactory: {e}", exc_info=True)
+    raise RuntimeError(f"Failed to write/upload CSV to Artifactory: {e}")
+
+finally:
+    try:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+            self.logger.info(f"Local file deleted: {output_path}")
+    except Exception as cleanup_error:
+        self.logger.warning(f"Failed to delete local file: {cleanup_error}")
